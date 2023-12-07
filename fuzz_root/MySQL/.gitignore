@@ -1,0 +1,4 @@
+afl-fuzz-mysql
+fuzz_output
+MutatorLog
+clientlog

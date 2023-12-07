@@ -1,0 +1,10 @@
+CREATE TABLE t1(aa, bb);
+CREATE TABLE IF NOT EXISTS t2(cc, dd);
+CREATE INDEX i1 ON t1(aa, bb);
+CREATE INDEX i2 ON t2(dd);
+INSERT INTO t1 VALUES (-2,-3), (2,-3), (-2,3), (2,3);
+INSERT INTO t2 VALUES (-2,-3), (2,-3), (-2,3), (2,3);
+EXPLAIN SELECT * FROM t1 WHERE ((abs(aa)=1 AND 1=2) OR abs(aa)=2) AND abs(bb)=3;
+EXPLAIN SELECT * FROM t1 JOIN t2 ON (t1.aa = t2.cc AND t1.bb=t2.dd) JOIN t1 AS r1 ON (t2.cc = r1.aa AND t2.dd = r1.bb);
+SELECT * FROM t1 WHERE ((abs(aa)=1 AND 1=2) OR abs(aa)=2) AND abs(bb)=3;
+SELECT * FROM t1 JOIN t2 ON (t1.aa = t2.cc AND t1.bb=t2.dd) JOIN t1 AS r1 ON (t2.cc = r1.aa AND t2.dd = r1.bb);

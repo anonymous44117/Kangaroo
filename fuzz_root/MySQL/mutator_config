@@ -1,0 +1,8 @@
+sql_library_path = init_lib        # default value: init_lib
+
+log_file = mylog                   # default value: mylog
+log_level = debug                  # default value: warning
+                                   # allow values: verbose, debug, info, notice, warning, error, close
+                                   # notice: only logs with a higher priority than INFO will be printed
+                                   #         if you compile the tool without the debug flag
+statement_max_nodes = 200          # the max numbers of parse tree nodes for a statement

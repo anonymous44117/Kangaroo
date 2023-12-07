@@ -1,0 +1,1044 @@
+diff --git a/client/mysql.cc b/client/mysql.cc
+index cf54f2fb..ed618492 100644
+--- a/client/mysql.cc
++++ b/client/mysql.cc
+@@ -24,6 +24,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+ 
+ // mysql command tool
+ 
++// Modified:
++bool multi_plan_done = false;
++
+ #include "my_config.h"
+ 
+ #include <errno.h>
+@@ -2437,6 +2440,23 @@ static COMMANDS *find_command(char *name) {
+   return (COMMANDS *)nullptr;
+ }
+ 
++static bool is_select(const char* stmt){
++  std::string str(stmt);
++  while(str.size() && (str.front() == ' ' || str.front() == '\n' || str.front() == '\t' || str.front() == '\r'))
++  str = str.substr(1, str.size() - 1);
++  if(str.substr(0, strlen("SELECT")) == std::string("SELECT")) return true;
++  if(str.substr(0, strlen("select")) == std::string("select")) return true;
++  return false;
++}
++
++static void select_processing(String& stmt){
++  int pos = 0;
++  char* s = (char*)stmt.ptr();
++  while(s[pos] != '\0' && (s[pos] == ' ' || s[pos] == '\n' || s[pos] == '\t' || s[pos] == '\r')) pos++;
++  if(s[pos] == '\0') return;
++  memcpy(s + pos, "Select", 6);
++}
++
+ static bool add_line(String &buffer, char *line, size_t line_length,
+                      char *in_string, bool *ml_comment, bool truncated) {
+   uchar inchar;
+@@ -2549,8 +2569,32 @@ static bool add_line(String &buffer, char *line, size_t line_length,
+       if ((com = find_command(buffer.c_ptr()))) {
+         if ((*com->func)(&buffer, buffer.c_ptr()) > 0) return true;  // Quit
+       } else {
+-        if (com_go(&buffer, nullptr) > 0)  // < 0 is not fatal
+-          return true;
++        // Modified: 
++        if(is_select(buffer.ptr())) {
++          bool first_execute = true;
++          select_processing(buffer);
++          String old_buffer(buffer);
++          while (true){
++            if(first_execute){
++              first_execute = false;
++              if (com_go(&buffer, 0) > 0)  // < 0 is not fatal
++              return true;
++            }
++            else{
++              String tmp_buffer(old_buffer);
++              if (com_go(&tmp_buffer, 0) > 0)  // < 0 is not fatal
++              return true;
++            }
++            if (multi_plan_done) {
++              multi_plan_done = false;
++              break;
++            }
++          }
++        }
++        else {
++          if (com_go(&buffer, 0) > 0)  // < 0 is not fatal
++            return true;
++        }
+       }
+       buffer.length(0);
+     } else if (!*ml_comment &&
+@@ -3075,7 +3119,14 @@ static int mysql_real_query_for_lazy(const char *buf, size_t length,
+ 
+     if (set_params && global_attrs->set_params(&mysql)) break;
+     if (!mysql_real_query(&mysql, buf, (ulong)length)) break;
+-    error = put_error(&mysql);
++    // Modified:
++    // fprintf(stderr, "%s\n", mysql_error(&mysql));
++    if(strcmp(mysql_error(&mysql), "Statement execute ended") == 0){
++      multi_plan_done = true;
++      error = -1;
++      break;
++    }
++    else error = put_error(&mysql);
+     if ((mysql_errno(&mysql) != CR_SERVER_GONE_ERROR &&
+          mysql_errno(&mysql) != CR_SERVER_LOST &&
+          mysql.net.error != NET_ERROR_SOCKET_UNUSABLE) ||
+diff --git a/share/messages_to_clients.txt b/share/messages_to_clients.txt
+index 5f42bcbf..ca1dfd2c 100644
+--- a/share/messages_to_clients.txt
++++ b/share/messages_to_clients.txt
+@@ -9736,6 +9736,9 @@ ER_IF_NOT_EXISTS_UNSUPPORTED_UDF_NATIVE_FCT_NAME_COLLISION
+ ER_SET_PASSWORD_AUTH_PLUGIN_ERROR
+   eng "SET PASSWORD has no significance for user '%s'@'%s' as the authentication method used doesn't store authentication data in the MySQL server. Please consider using ALTER USER instead if you want to change authentication parameters."
+ 
++ER_MULTI_PLAN_END
++  eng "Statement execute ended"
++
+ #
+ #  End of 8.0 error messages (server-to-client).
+ #  Do NOT add messages intended for the error log above!
+diff --git a/sql/CMakeLists.txt b/sql/CMakeLists.txt
+index 710014e8..f0f6fa8c 100644
+--- a/sql/CMakeLists.txt
++++ b/sql/CMakeLists.txt
+@@ -341,6 +341,7 @@ SET(SQL_GIS_SOURCES
+ )
+ 
+ SET(SQL_SHARED_SOURCES
++  common_vars.cc
+   auth/auth_acls.cc
+   auth/auth_common.cc
+   auth/dynamic_privileges_impl.cc
+diff --git a/sql/common_vars.cc b/sql/common_vars.cc
+new file mode 100644
+index 00000000..da24c905
+--- /dev/null
++++ b/sql/common_vars.cc
+@@ -0,0 +1,11 @@
++#include "common_vars.h"
++// Modified: 2.2
++bool is_multi_plan_open = false;
++bool multi_plan_done = false;
++int all_query_depth;
++int now_query_depth;
++int all_length_per_depth[MAX_DEPTH];
++int now_length_per_depth[MAX_DEPTH];
++int chosen_per_depth[MAX_DEPTH];
++int exec_times;
++int keep_dep;
+\ No newline at end of file
+diff --git a/sql/common_vars.h b/sql/common_vars.h
+new file mode 100644
+index 00000000..6a1fda39
+--- /dev/null
++++ b/sql/common_vars.h
+@@ -0,0 +1,19 @@
++#ifndef COMMON_VARS_INCLUDED
++#define COMMON_VARS_INCLUDED
++
++#include <vector>
++#include <string>
++
++// Modified: 2.1
++extern bool is_multi_plan_open;
++extern bool multi_plan_done;
++extern int all_query_depth;
++extern int now_query_depth;
++const int MAX_DEPTH = 3628800;
++extern int all_length_per_depth[MAX_DEPTH];
++extern int now_length_per_depth[MAX_DEPTH];
++extern int chosen_per_depth[MAX_DEPTH];
++extern int exec_times;
++extern int keep_dep;
++
++#endif /* COMMON_VARS_INCLUDED */
+\ No newline at end of file
+diff --git a/sql/range_optimizer/group_index_skip_scan_plan.cc b/sql/range_optimizer/group_index_skip_scan_plan.cc
+index 6f260cfb..5a42608d 100644
+--- a/sql/range_optimizer/group_index_skip_scan_plan.cc
++++ b/sql/range_optimizer/group_index_skip_scan_plan.cc
+@@ -446,6 +446,8 @@ AccessPath *get_best_group_min_max(THD *thd, RANGE_OPT_PARAM *param,
+   SEL_ROOT *cur_index_tree = nullptr;
+   ha_rows cur_quick_prefix_records = 0;
+   Opt_trace_array trace_indexes(trace, "potential_group_range_indexes");
++  bool chosen = false;
++  ++now_query_depth;
+   // We go through allowed indexes
+   for (uint cur_param_idx = 0; cur_param_idx < param->keys; ++cur_param_idx) {
+     const uint cur_index = param->real_keynr[cur_param_idx];
+@@ -793,7 +795,14 @@ AccessPath *get_best_group_min_max(THD *thd, RANGE_OPT_PARAM *param,
+     {
+       Cost_estimate min_diff_cost = cur_read_cost;
+       min_diff_cost.multiply(DBL_EPSILON);
+-      if (cur_read_cost < (best_read_cost - min_diff_cost)) {
++      // Modified: 2022-06-06
++      chosen = false;
++      if(is_multi_plan_open){
++        now_length_per_depth[now_query_depth]++;
++        chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++      }
++      else chosen = cur_read_cost < (best_read_cost - min_diff_cost);
++      if (chosen) {
+         index_info = cur_index_info;
+         index = cur_index;
+         best_read_cost = cur_read_cost;
+@@ -815,6 +824,7 @@ AccessPath *get_best_group_min_max(THD *thd, RANGE_OPT_PARAM *param,
+       cause = nullptr;
+     }
+   }
++  if(is_multi_plan_open && now_length_per_depth[now_query_depth] == 0) --now_query_depth;
+   trace_indexes.end();
+ 
+   if (!index_info) /* No usable index found. */
+diff --git a/sql/range_optimizer/group_index_skip_scan_plan.h b/sql/range_optimizer/group_index_skip_scan_plan.h
+index e6ce637e..43a93633 100644
+--- a/sql/range_optimizer/group_index_skip_scan_plan.h
++++ b/sql/range_optimizer/group_index_skip_scan_plan.h
+@@ -29,6 +29,7 @@
+ #include "my_inttypes.h"
+ #include "sql/range_optimizer/range_optimizer.h"
+ #include "sql/sql_const.h"
++#include "sql/common_vars.h"
+ 
+ class KEY;
+ class KEY_PART_INFO;
+diff --git a/sql/range_optimizer/index_range_scan_plan.cc b/sql/range_optimizer/index_range_scan_plan.cc
+index 9564ce28..f876d722 100644
+--- a/sql/range_optimizer/index_range_scan_plan.cc
++++ b/sql/range_optimizer/index_range_scan_plan.cc
+@@ -844,7 +844,8 @@ AccessPath *get_key_scans_params(THD *thd, RANGE_OPT_PARAM *param,
+   bool use_cheapest_index_merge = false;
+   bool force_index_merge =
+       idx_merge_hint_state(thd, param->table, &use_cheapest_index_merge);
+-
++  // Modified:
++  bool flag_add_depth = true;
+   for (idx = 0; idx < param->keys; idx++) {
+     key = tree->keys[idx];
+     if (key) {
+@@ -913,24 +914,30 @@ AccessPath *get_key_scans_params(THD *thd, RANGE_OPT_PARAM *param,
+         tree->ror_scans_map.set_bit(idx);
+       }
+ 
+-      if (found_records != HA_POS_ERROR &&
+-          (read_cost > cost.total_cost() ||
+-           /*
+-             Ignore cost check if INDEX_MERGE hint is used with
+-             explicitly specified indexes or if INDEX_MERGE hint
+-             is used without any specified indexes and no best
+-             index is chosen yet.
+-           */
+-           (force_index_merge &&
+-            (!use_cheapest_index_merge || !key_to_read)))) {
+-        trace_idx.add("chosen", true);
+-        read_cost = cost.total_cost();
+-        best_records = found_records;
+-        key_to_read = key;
+-        best_idx = idx;
+-        best_mrr_flags = mrr_flags;
+-        best_buf_size = buf_size;
+-        is_best_idx_imerge_scan = is_imerge_scan;
++      if (found_records != HA_POS_ERROR) {
++        // Modified: 
++        bool chosen = false;
++        if (is_multi_plan_open) {
++          if (flag_add_depth) {
++            flag_add_depth = false;
++            ++now_query_depth;
++            ++now_length_per_depth[now_query_depth]; // means don't choose any indices
++          }
++          ++now_length_per_depth[now_query_depth]; // means choose which index
++          chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++        }
++        else chosen = read_cost > cost.total_cost();
++        if(chosen || (force_index_merge &&
++            (!use_cheapest_index_merge || !key_to_read))) {
++          trace_idx.add("chosen", true);
++          read_cost = cost.total_cost();
++          best_records = found_records;
++          key_to_read = key;
++          best_idx = idx;
++          best_mrr_flags = mrr_flags;
++          best_buf_size = buf_size;
++          is_best_idx_imerge_scan = is_imerge_scan;
++        }
+       } else {
+         trace_idx.add("chosen", false);
+         if (found_records == HA_POS_ERROR)
+diff --git a/sql/range_optimizer/index_range_scan_plan.h b/sql/range_optimizer/index_range_scan_plan.h
+index 634aa8ae..047c1ceb 100644
+--- a/sql/range_optimizer/index_range_scan_plan.h
++++ b/sql/range_optimizer/index_range_scan_plan.h
+@@ -33,6 +33,7 @@
+ #include "sql/range_optimizer/range_optimizer.h"
+ #include "sql/range_optimizer/reverse_index_range_scan.h"
+ #include "sql/sql_const.h"
++#include "sql/common_vars.h"
+ 
+ class Opt_trace_object;
+ class RANGE_OPT_PARAM;
+diff --git a/sql/range_optimizer/index_skip_scan_plan.cc b/sql/range_optimizer/index_skip_scan_plan.cc
+index df5e116a..0d9d8a92 100644
+--- a/sql/range_optimizer/index_skip_scan_plan.cc
++++ b/sql/range_optimizer/index_skip_scan_plan.cc
+@@ -173,6 +173,7 @@ AccessPath *get_best_skip_scan(THD *thd, RANGE_OPT_PARAM *param, SEL_TREE *tree,
+   Cost_estimate best_read_cost;
+   ha_rows best_records = 0;
+   bool has_aggregate_function = false;
++  bool chosen = false;
+   DBUG_TRACE;
+   best_read_cost.set_max_cost();
+   Opt_trace_object trace_group(trace, "skip_scan_range",
+@@ -364,7 +365,16 @@ AccessPath *get_best_skip_scan(THD *thd, RANGE_OPT_PARAM *param, SEL_TREE *tree,
+ 
+     min_diff_cost = cur_read_cost;
+     min_diff_cost.multiply(DBL_EPSILON);
+-    if (cur_read_cost < (best_read_cost - min_diff_cost)) {
++    // Modified: 2022-06-06
++    chosen = false;
++    if(is_multi_plan_open){
++      ++now_query_depth;
++      now_length_per_depth[now_query_depth] = 2;
++      
++      chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++    }
++    else chosen = cur_read_cost < (best_read_cost - min_diff_cost);
++    if (chosen) {
+       index_info = cur_index_info;
+       index = cur_index;
+       best_read_cost = cur_read_cost;
+diff --git a/sql/range_optimizer/index_skip_scan_plan.h b/sql/range_optimizer/index_skip_scan_plan.h
+index 6e1b7e8d..8ef40fb8 100644
+--- a/sql/range_optimizer/index_skip_scan_plan.h
++++ b/sql/range_optimizer/index_skip_scan_plan.h
+@@ -27,6 +27,7 @@
+ 
+ #include "my_base.h"
+ #include "sql/range_optimizer/range_optimizer.h"
++#include "sql/common_vars.h"
+ 
+ class KEY;
+ class KEY_PART_INFO;
+diff --git a/sql/range_optimizer/range_optimizer.cc b/sql/range_optimizer/range_optimizer.cc
+index bdefbf00..9421e50a 100644
+--- a/sql/range_optimizer/range_optimizer.cc
++++ b/sql/range_optimizer/range_optimizer.cc
+@@ -663,7 +663,7 @@ int test_quick_select(THD *thd, MEM_ROOT *return_mem_root,
+       }
+     }
+   }
+-
++  ++now_query_depth;
+   /*
+     Try to construct a GroupIndexSkipScanIterator.
+     Notice that it can be constructed no matter if there is a range tree.
+@@ -677,8 +677,15 @@ int test_quick_select(THD *thd, MEM_ROOT *return_mem_root,
+     Opt_trace_object grp_summary(trace, "best_group_range_summary",
+                                  Opt_trace_context::RANGE_OPTIMIZER);
+     if (unlikely(trace->is_started()))
+-      trace_basic_info(thd, group_path, &param, &grp_summary);
+-    if (group_path->cost < best_cost) {
++    trace_basic_info(thd, group_path, &param, &grp_summary);
++    // Modified: 2022-06-06
++    bool chosen = false;
++    if(is_multi_plan_open){
++      now_length_per_depth[now_query_depth]++;
++      chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++    }
++    else chosen = group_path->cost < best_cost;
++    if (chosen) {
+       grp_summary.add("chosen", true);
+       best_path = group_path;
+       best_cost = best_path->cost;
+@@ -700,8 +707,14 @@ int test_quick_select(THD *thd, MEM_ROOT *return_mem_root,
+                                Opt_trace_context::RANGE_OPTIMIZER);
+       if (unlikely(trace->is_started()))
+         trace_basic_info(thd, skip_scan_path, &param, &summary);
+-
+-      if (skip_scan_path->cost < best_cost || force_skip_scan) {
++      // Modified: 2022-06-07
++      bool chosen = false;
++      if(is_multi_plan_open){
++        now_length_per_depth[now_query_depth]++;
++        chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++      }
++      else chosen = skip_scan_path->cost < best_cost;
++      if (chosen || force_skip_scan) {
+         summary.add("chosen", true);
+         best_path = skip_scan_path;
+         best_cost = best_path->cost;
+@@ -788,16 +801,23 @@ int test_quick_select(THD *thd, MEM_ROOT *return_mem_root,
+             param.table->quick_condition_rows =
+                 min<double>(param.table->quick_condition_rows,
+                             new_conj_path->num_output_rows);
+-          if (!best_conj_path ||
+-              (new_conj_path && new_conj_path->cost < best_conj_path->cost)) {
+-            best_conj_path = new_conj_path;
++          if (!best_conj_path) best_conj_path = new_conj_path;
++          else if(new_conj_path) {
++            // Modified: 2022-06-07
++            bool chosen = false;
++            if(is_multi_plan_open){
++              now_length_per_depth[now_query_depth]++;
++              chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++            }
++            else chosen = new_conj_path->cost < best_conj_path->cost;
++            if(chosen) best_conj_path = new_conj_path;
+           }
+         }
+         if (best_conj_path) best_path = best_conj_path;
+       }
+     }
+   }
+-
++  if(is_multi_plan_open && !now_length_per_depth[now_query_depth]) now_query_depth--;
+   /*
+     If we got a read plan, return it, but only if the storage engine supports
+     using indexes for access.
+@@ -922,7 +942,16 @@ static AccessPath *get_ror_union_path(
+ 
+   trace_best_disjunct->add("index_roworder_union_cost", roru_total_cost)
+       .add("members", roru_read_plans.size());
+-  if (roru_total_cost < read_cost || force_index_merge) {
++  // Modified: 2022-06-06
++  bool chosen = false;
++  if(is_multi_plan_open){
++    ++now_query_depth;
++    now_length_per_depth[now_query_depth] = 2;
++    
++    chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++  }
++  else chosen = roru_total_cost < read_cost;
++  if (chosen || force_index_merge) {
+     trace_best_disjunct->add("chosen", true);
+ 
+     auto *children = new (param->return_mem_root)
+@@ -1046,6 +1075,7 @@ static AccessPath *get_best_disjunct_quick(
+   bool all_scans_ror_able = true;
+   const Cost_model_table *const cost_model = table->cost_model();
+   double read_cost = cost_est;
++  bool chosen = false;
+ 
+   DBUG_TRACE;
+   DBUG_PRINT("info", ("Full table scan cost: %g", cost_est));
+@@ -1195,8 +1225,16 @@ static AccessPath *get_best_disjunct_quick(
+     trace_best_disjunct.add("total_cost", imerge_cost);
+     DBUG_PRINT("info", ("index_merge cost: %g (wanted: less then %g)",
+                         imerge_cost, read_cost));
+-
+-    if (imerge_cost < read_cost || force_index_merge) {
++    // Modified: 2022-06-06
++    chosen = false;
++    if(is_multi_plan_open){
++      ++now_query_depth;
++      now_length_per_depth[now_query_depth] = 2;
++      
++      chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++    }
++    else chosen = imerge_cost < read_cost;
++    if (chosen || force_index_merge) {
+       imerge_path = new (param->return_mem_root) AccessPath;
+       imerge_path->type = AccessPath::INDEX_MERGE;
+       imerge_path->index_merge().table = table;
+diff --git a/sql/range_optimizer/range_optimizer.h b/sql/range_optimizer/range_optimizer.h
+index 5be90a78..4f357786 100644
+--- a/sql/range_optimizer/range_optimizer.h
++++ b/sql/range_optimizer/range_optimizer.h
+@@ -42,6 +42,7 @@
+ #include "sql/sql_bitmap.h"
+ #include "sql/sql_const.h"
+ #include "sql_string.h"
++#include "sql/common_vars.h"
+ 
+ class Item;
+ class Opt_trace_context;
+diff --git a/sql/range_optimizer/rowid_ordered_retrieval_plan.cc b/sql/range_optimizer/rowid_ordered_retrieval_plan.cc
+index 1fa26456..59ccd71a 100644
+--- a/sql/range_optimizer/rowid_ordered_retrieval_plan.cc
++++ b/sql/range_optimizer/rowid_ordered_retrieval_plan.cc
+@@ -888,7 +888,16 @@ AccessPath *get_best_ror_intersect(
+ 
+     *(intersect_scans_end++) = *(cur_ror_scan++);
+ 
+-    if (intersect->total_cost < min_cost ||
++    // Modified: 2022-06-06
++    bool chosen = false;
++    if(is_multi_plan_open){
++      ++now_query_depth;
++      now_length_per_depth[now_query_depth] = 2;
++      
++      chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++    }
++    else chosen = intersect->total_cost < min_cost;
++    if (chosen ||
+         (force_index_merge &&
+          /*
+            If INDEX_MERGE hint is used without only specified index,
+@@ -939,16 +948,28 @@ AccessPath *get_best_ror_intersect(
+     Opt_trace_object trace_cpk(trace, "clustered_pk");
+     if (cpk_scan && !intersect->is_covering &&
+         compound_hint_key_enabled(table, cpk_no, INDEX_MERGE_HINT_ENUM)) {
++      // Modified: 2022-06-06
+       if (ror_intersect_add(intersect, needed_fields, cpk_scan, true,
+-                            &trace_cpk, true) &&
+-          ((intersect->total_cost < min_cost) ||
++                            &trace_cpk, true)) {
++        bool chosen = false;
++        if(is_multi_plan_open){
++          ++now_query_depth;
++          now_length_per_depth[now_query_depth] = 2;
++          
++          chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++        }
++        else chosen = intersect->total_cost < min_cost;
++        if (chosen ||
+            (force_index_merge &&
+-            (!use_cheapest_index_merge ||
+-             (best_num == 1 && force_index_merge_result))))) {
+-        trace_cpk.add("clustered_pk_scan_added_to_intersect", true)
+-            .add("cumulated_cost", intersect->total_cost);
+-        cpk_scan_used = true;
+-        intersect_best = intersect;  // just set pointer here
++             (!use_cheapest_index_merge ||
++             (best_num == 1 && force_index_merge_result)))) {
++                 trace_cpk.add("clustered_pk_scan_added_to_intersect", true)
++                     .add("cumulated_cost", intersect->total_cost);
++                 cpk_scan_used = true;
++                 intersect_best = intersect;  // just set pointer here
++        } else
++            trace_cpk.add("clustered_pk_added_to_intersect", false)
++                .add_alnum("cause", "cost");
+       } else
+         trace_cpk.add("clustered_pk_added_to_intersect", false)
+             .add_alnum("cause", "cost");
+@@ -958,8 +979,17 @@ AccessPath *get_best_ror_intersect(
+                                        : "no_clustered_pk_index");
+     }
+   }
++  // Modified: 2022-06-06
++  bool chosen = false;
++  if(is_multi_plan_open){
++    ++now_query_depth;
++    now_length_per_depth[now_query_depth] = 2;
++    
++    chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++  }
++  else chosen = min_cost.total_cost() < cost_est;
+   /* Ok, return ROR-intersect plan if we have found one */
+-  if ((min_cost.total_cost() < cost_est || force_index_merge) &&
++  if ((chosen || force_index_merge) &&
+       (cpk_scan_used || best_num > 1)) {
+     // Create AccessPaths from the ROR child scans.
+     auto *children = new (param->return_mem_root)
+diff --git a/sql/range_optimizer/rowid_ordered_retrieval_plan.h b/sql/range_optimizer/rowid_ordered_retrieval_plan.h
+index 6b6c669a..4c5daee7 100644
+--- a/sql/range_optimizer/rowid_ordered_retrieval_plan.h
++++ b/sql/range_optimizer/rowid_ordered_retrieval_plan.h
+@@ -29,6 +29,7 @@
+ #include "my_bitmap.h"
+ #include "sql/handler.h"
+ #include "sql/range_optimizer/range_optimizer.h"
++#include "sql/common_vars.h"
+ 
+ class Opt_trace_object;
+ class RANGE_OPT_PARAM;
+diff --git a/sql/sql_optimizer.cc b/sql/sql_optimizer.cc
+index f49ee59c..cc78d4e2 100644
+--- a/sql/sql_optimizer.cc
++++ b/sql/sql_optimizer.cc
+@@ -5224,6 +5224,12 @@ bool JOIN::make_join_plan() {
+   if (sj_nests && optimize_semijoin_nests_for_materialization(this))
+     return true;
+ 
++  // Modified: 2.8
++  if(is_multi_plan_open){
++    ++now_query_depth;
++    keep_dep = now_query_depth;
++  }
++
+   // Choose the table order based on analysis done so far.
+   if (Optimize_table_order(thd, this, nullptr).choose_table_order())
+     return true;
+@@ -6422,6 +6428,11 @@ static bool optimize_semijoin_nests_for_materialization(JOIN *join) {
+       if (!sj_nest->nested_join->sjm.scan_allowed &&
+           !sj_nest->nested_join->sjm.lookup_allowed)
+         continue;
++      // Modified: 
++      if(is_multi_plan_open){
++        ++now_query_depth;
++        keep_dep = now_query_depth;
++      }
+ 
+       if (Optimize_table_order(join->thd, join, sj_nest).choose_table_order())
+         return true;
+@@ -10883,6 +10894,11 @@ bool JOIN::compare_costs_of_subquery_strategies(Subquery_strategy *method) {
+     allow_outer_refs = false;
+ 
+     if (optimize_semijoin_nests_for_materialization(this)) return true;
++    // Modified: 
++    if(is_multi_plan_open){
++      ++now_query_depth;
++      keep_dep = now_query_depth;
++    }
+ 
+     if (Optimize_table_order(thd, this, nullptr).choose_table_order())
+       return true;
+diff --git a/sql/sql_optimizer.h b/sql/sql_optimizer.h
+index 75e0a156..589cb6c0 100644
+--- a/sql/sql_optimizer.h
++++ b/sql/sql_optimizer.h
+@@ -51,6 +51,8 @@
+ #include "sql/sql_select.h"  // Key_use
+ #include "sql/table.h"
+ #include "sql/temp_table_param.h"
++// Modified: 2.7
++#include "sql/common_vars.h"
+ 
+ enum class Subquery_strategy : int;
+ class COND_EQUAL;
+diff --git a/sql/sql_parse.cc b/sql/sql_parse.cc
+index df6af08c..69bb0ce3 100644
+--- a/sql/sql_parse.cc
++++ b/sql/sql_parse.cc
+@@ -1216,6 +1216,54 @@ void bind_fields(Item *first) {
+   for (Item *item = first; item; item = item->next_free) item->bind_fields();
+ }
+ 
++static void reset_multi_execute_status(){
++  // Modified: 2.3
++  exec_times = 0;
++  now_query_depth = 0;
++  memset(now_length_per_depth, 0, sizeof(now_length_per_depth));
++  memset(chosen_per_depth, 0, sizeof(chosen_per_depth));
++}
++
++void clr(int depth){
++    if(depth > now_query_depth) return;
++    chosen_per_depth[depth] = 0;
++    clr(depth+1);
++}
++
++static bool next_plan(){
++  for(int i = now_query_depth; i > 0; i--){
++    if(chosen_per_depth[i] + 1 < now_length_per_depth[i]){
++      chosen_per_depth[i]++;
++      clr(i+1);
++      return true;
++    }
++  }
++  return false;
++}
++
++static bool is_select(const char* stmt){
++  std::string str(stmt);
++  while(str.size() && (str.front() == ' ' || str.front() == '\n' || str.front() == '\t'))
++  str = str.substr(1, str.size() - 1);
++  if(str.substr(0, strlen("Select")) == std::string("Select")) return true;
++  // if(str.substr(0, strlen("select")) == std::string("select")) return true;
++  return false;
++}
++
++static std::string former;
++bool same_as_former(const char* stmt){
++  std::string cmp = std::string(stmt);
++  while(cmp.size() && (cmp.back() == ';' || cmp.back() == ' ')) cmp.pop_back();
++//  FILE* fd = fopen("mydebug.txt", "a+");
++//  fprintf(fd, "cmp    = %s\n", cmp.c_str());
++//  fprintf(fd, "former = %s\n", former.c_str());
++//  fprintf(fd, "result = %d\n", cmp == former);
++//  fflush(fd);
++//  fclose(fd);
++  if(cmp == former) return true;
++  return false;
++}
++
+ /**
+   Read one command from connection and execute it (query or simple command).
+   This function is called in loop from thread function.
+@@ -1228,8 +1276,11 @@ void bind_fields(Item *first) {
+     1  request of thread shutdown (see dispatch_command() description)
+ */
+ 
++clock_t start_time;
++clock_t finish_time;
+ bool do_command(THD *thd) {
+-  bool return_value;
++  // Modified: 0.1
++  bool return_value = false;
+   int rc;
+   NET *net = nullptr;
+   enum enum_server_command command = COM_SLEEP;
+@@ -1346,7 +1397,54 @@ bool do_command(THD *thd) {
+       thd->variables.net_buffer_length);
+   /* Restore read timeout value */
+   my_net_set_read_timeout(net, thd->variables.net_read_timeout);
+-
++  // Modified: 0.2
++  if(command == COM_QUERY && is_select(com_data.com_query.query)){
++    DBUG_PRINT("info", ("RUN INTO MULTIPLAN: %s", com_data.com_query.query));
++    // Modified: 2.4
++    if(!same_as_former(com_data.com_query.query)) { // first SELECT
++      former = std::string(com_data.com_query.query);
++      while(former.size() && (former.back() == ';' || former.back() == ' ')) former.pop_back();
++      reset_multi_execute_status();
++      start_time = clock();
++//      FILE* fd = fopen("mydebug.txt", "a+");
++//      fprintf(fd, "start_time  = %d\n", start_time);
++//      fclose(fd);
++      is_multi_plan_open = true;
++    }
++    else if(!next_plan()){ // final SELECT has been executed
++      // FILE* fp = fopen("plans.txt", "a+");
++//      fprintf(fp, "%s\n", com_data.com_query.query);
++      // fprintf(fp, "depth = %d, total = %d\n", now_query_depth, exec_times);
++//      fprintf(fp, "\n");
++      // fclose(fp);
++      my_error(ER_MULTI_PLAN_END, MYF(0));
++      former.clear();
++      multi_plan_done = true;
++      is_multi_plan_open = false;
++    }
++    else{
++      finish_time = clock();
++//      FILE* fd = fopen("mydebug.txt", "a+");
++//      fprintf(fd, "finish_time = %d\n", finish_time);
++//      fprintf(fd, "run_time    = %.2f\n", 1.0 * (finish_time - start_time) / CLOCKS_PER_SEC);
++//      fclose(fd);
++      if(1.0 * (finish_time - start_time) / CLOCKS_PER_SEC > 10) { // 10s
++        my_error(ER_MULTI_PLAN_END, MYF(0));
++        former.clear();
++        multi_plan_done = true;
++        is_multi_plan_open = false;
++        // FILE* fp = fopen("plans.txt", "a+");
++//        fprintf(fp, "%s\n", com_data.com_query.query);
++        // fprintf(fp, "depth = %d, total = %d\n", now_query_depth, exec_times);
++//        fprintf(fp, "\n");
++        // fclose(fp);
++      }
++    }
++    now_query_depth = 0;
++    memset(now_length_per_depth, 0, sizeof(now_length_per_depth));
++  }
++  else is_multi_plan_open = false;
++  if(is_multi_plan_open) exec_times++;
+   DEBUG_SYNC(thd, "before_command_dispatch");
+ 
+   return_value = dispatch_command(thd, &com_data, command);
+@@ -1706,6 +1804,11 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
+     goto done;
+   }
+ 
++  // Modified: 
++  if (multi_plan_done) {
++    multi_plan_done = false;
++    goto done;
++  }
+   /**
+     Enforce password expiration for all RPC commands, except the
+     following:
+diff --git a/sql/sql_parse.h b/sql/sql_parse.h
+index 49ad670f..12849a25 100644
+--- a/sql/sql_parse.h
++++ b/sql/sql_parse.h
+@@ -34,6 +34,8 @@
+ #include "sql/handler.h"           // enum_schema_tables
+ #include "sql/system_variables.h"  // System_variables
+ #include "storage/perfschema/terminology_use_previous_enum.h"
++// Modified: 4.3
++#include "common_vars.h"
+ 
+ struct mysql_rwlock_t;
+ template <typename T>
+diff --git a/sql/sql_planner.cc b/sql/sql_planner.cc
+index 0b15a498..2b7ae0ea 100644
+--- a/sql/sql_planner.cc
++++ b/sql/sql_planner.cc
+@@ -705,10 +705,26 @@ Key_use *Optimize_table_order::find_best_ref(
+     */
+     bool new_candidate = false;
+ 
+-    if (best_found_keytype >= NOT_UNIQUE && cur_keytype >= NOT_UNIQUE)
+-      new_candidate = cur_ref_cost < best_ref_cost;  // 1
+-    else if (best_found_keytype == cur_keytype)
+-      new_candidate = cur_ref_cost < best_ref_cost;  // 2
++    if (best_found_keytype >= NOT_UNIQUE && cur_keytype >= NOT_UNIQUE){
++        // Modified: 2022-06-06
++        if(is_multi_plan_open){
++          ++now_query_depth;
++          now_length_per_depth[now_query_depth] = 2;
++          
++          new_candidate = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++        }
++        else new_candidate = cur_ref_cost < best_ref_cost;  // 1
++    }
++    else if (best_found_keytype == cur_keytype){
++        // Modified: 2022-06-06
++        if(is_multi_plan_open){
++          ++now_query_depth;
++          now_length_per_depth[now_query_depth] = 2;
++          
++          new_candidate = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++        }
++        else new_candidate = cur_ref_cost < best_ref_cost;  // 2
++    }
+     else if (best_found_keytype > cur_keytype)
+       new_candidate = true;  // 3
+ 
+@@ -1153,10 +1169,7 @@ void Optimize_table_order::best_access_path(JOIN_TAB *tab,
+     trace_access_scan.add("resulting_rows", rows_after_filtering);
+     trace_access_scan.add("cost", scan_total_cost);
+ 
+-    if (best_ref == nullptr ||
+-        (scan_total_cost <
+-         best_read_cost +
+-             cost_model->row_evaluate_cost(prefix_rowcount * rows_fetched))) {
++    if (best_ref == nullptr) {
+       /*
+         If the table has a range (tab->quick is set) make_join_query_block()
+         will ensure that this will be used
+@@ -1183,6 +1196,45 @@ void Optimize_table_order::best_access_path(JOIN_TAB *tab,
+       best_uses_jbuf = !disable_jbuf;
+       ref_depend_map = 0;
+     }
++    else {
++      // Modified: 2022-06-07
++      bool chosen = false;
++      if(is_multi_plan_open) {
++        ++now_query_depth;
++        now_length_per_depth[now_query_depth] = 2;
++        chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++      }
++      else chosen = (scan_total_cost <
++         best_read_cost +
++             cost_model->row_evaluate_cost(prefix_rowcount * rows_fetched));
++      if (chosen) {
++        /*
++          If the table has a range (tab->quick is set) make_join_query_block()
++          will ensure that this will be used
++        */
++        best_read_cost = scan_read_cost;
++        rows_fetched = rows_after_filtering;
++
++        if (tab->found_records) {
++          /*
++            Although join buffering may be used for this table, this
++            filter calculation is not done to calculate the cost of join
++            buffering itself (that is done inside
++            calculate_scan_cost()). The is_join_buffering parameter is
++            therefore 'false'.
++          */
++          const float full_filter = calculate_condition_filter(
++              tab, nullptr, ~remaining_tables & ~excluded_tables,
++              static_cast<double>(tab->found_records), false, false,
++              trace_access_scan);
++          filter_effect = static_cast<float>(std::min(
++              1.0, tab->found_records * full_filter / rows_after_filtering));
++        }
++        best_ref = nullptr;
++        best_uses_jbuf = !disable_jbuf;
++        ref_depend_map = 0;
++      }
++    }
+ 
+     trace_access_scan.add("chosen", best_ref == nullptr);
+   }
+@@ -1605,7 +1657,7 @@ bool Optimize_table_order::semijoin_loosescan_fill_driving_table_position(
+   Opt_trace_context *const trace = &thd->opt_trace;
+   Opt_trace_object trace_wrapper(trace);
+   Opt_trace_object trace_ls(trace, "searching_loose_scan_index");
+-
++  ++now_query_depth;
+   TABLE *const table = tab->table();
+   assert(remaining_tables & tab->table_ref->map());
+ 
+@@ -1760,7 +1812,14 @@ bool Optimize_table_order::semijoin_loosescan_fill_driving_table_position(
+     if (bound_keyparts & 1) {
+       Opt_trace_object trace_ref(trace, "ref");
+       trace_ref.add("cost", start_key->read_cost);
+-      if (start_key->read_cost < pos->read_cost) {
++      // Modified: 2022-06-06
++      bool chosen = false;
++      if(is_multi_plan_open){
++        now_length_per_depth[now_query_depth]++;
++        chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++      }
++      else chosen = start_key->read_cost < pos->read_cost;
++      if (chosen) {
+         // @TODO use rec-per-key-based fanout calculations
+         pos->loosescan_key = key;
+         pos->read_cost = start_key->read_cost;
+@@ -1800,8 +1859,15 @@ bool Optimize_table_order::semijoin_loosescan_fill_driving_table_position(
+       }
+ 
+       trace_cov_scan.add("cost", cost);
++      // Modified: 2022-06-06
++      bool chosen = false;
++      if(is_multi_plan_open){
++        now_length_per_depth[now_query_depth]++;
++        chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++      }
++      else chosen = cost < pos->read_cost;
+       // @TODO: previous version also did /2
+-      if (cost < pos->read_cost) {
++      if (chosen) {
+         pos->loosescan_key = key;
+         pos->read_cost = cost;
+         pos->rows_fetched = rowcount;
+@@ -1820,7 +1886,14 @@ bool Optimize_table_order::semijoin_loosescan_fill_driving_table_position(
+     Opt_trace_object trace_range(trace, "range_scan");
+     trace_range.add("cost", tab->range_scan()->cost);
+     // @TODO: this the right part restriction:
+-    if (tab->range_scan()->cost < pos->read_cost) {
++    // Modified: 2022-06-06
++    bool chosen = false;
++    if(is_multi_plan_open){
++      now_length_per_depth[now_query_depth]++;
++      chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++    }
++    else chosen = tab->range_scan()->cost < pos->read_cost;
++    if (chosen) {
+       pos->loosescan_key = used_index(tab->range_scan());
+       pos->read_cost = tab->range_scan()->cost;
+       // this is ok because idx == join->const_tables
+@@ -1830,7 +1903,7 @@ bool Optimize_table_order::semijoin_loosescan_fill_driving_table_position(
+       trace_range.add("chosen", true);
+     }
+   }
+-
++  if(is_multi_plan_open && now_length_per_depth[now_query_depth] == 0) now_query_depth--;
+   if (pos->read_cost != DBL_MAX) {
+     pos->read_cost += derived_mat_cost;
+     pos->filter_effect = calculate_condition_filter(
+@@ -2530,6 +2603,9 @@ bool Optimize_table_order::consider_plan(uint idx,
+   bool cheaper = cost < join->best_read;
+   bool chosen = found_plan_with_allowed_sj ? (plan_uses_allowed_sj && cheaper)
+                                            : (plan_uses_allowed_sj || cheaper);
++  // Modified: 2.11
++  if(is_multi_plan_open)
++  cheaper = chosen = (chosen_per_depth[keep_dep] == now_length_per_depth[keep_dep] - 1);
+ 
+   /*
+     If the statement is executed on a secondary engine, and the secondary engine
+@@ -2817,7 +2893,8 @@ bool Optimize_table_order::best_extension_by_limited_search(
+         we continue the search since this partial plan may support other
+         semi-join strategies.
+       */
+-      if (position->prefix_cost >= join->best_read &&
++     // Modified: 
++      if (!is_multi_plan_open && position->prefix_cost >= join->best_read &&
+           found_plan_with_allowed_sj) {
+         DBUG_EXECUTE("opt",
+                      print_plan(join, idx + 1, position->prefix_rowcount,
+@@ -2832,7 +2909,8 @@ bool Optimize_table_order::best_extension_by_limited_search(
+         Prune some less promising partial plans. This heuristic may miss
+         the optimal QEPs, thus it results in a non-exhaustive search.
+       */
+-      if (prune_level == 1) {
++     // Modified: 
++      if (!is_multi_plan_open && prune_level == 1) {
+         if (best_rowcount > position->prefix_rowcount ||
+             best_cost > position->prefix_cost ||
+             (idx == join->const_tables &&  // 's' is the first table in the QEP
+@@ -2869,7 +2947,9 @@ bool Optimize_table_order::best_extension_by_limited_search(
+             2) and, There are tables joined by (EQ_)REF key.
+             3) and, There is a 1::1 relation between those tables
+         */
+-        if (prune_level == 1 &&             // 1)
++       // Modified: 
++        if (!is_multi_plan_open &&
++            prune_level == 1 &&             // 1)
+             position->key != nullptr &&     // 2)
+             position->rows_fetched <= 1.0)  // 3)
+         {
+@@ -2913,6 +2993,11 @@ bool Optimize_table_order::best_extension_by_limited_search(
+           return true;
+       } else  // if ((current_search_depth > 1) && ...
+       {
++        // Modified: 2.10
++        if(is_multi_plan_open)
++        {
++          ++now_length_per_depth[keep_dep];
++        }
+         if (consider_plan(idx, &trace_one_table)) return true;
+         /*
+           If plan is complete, there should be no "open" outer join nest, and
+@@ -4101,7 +4186,7 @@ void Optimize_table_order::advance_sj_state(table_map remaining_tables,
+   double best_cost = pos->prefix_cost;
+   double best_rowcount = pos->prefix_rowcount;
+   uint sj_strategy = SJ_OPT_NONE;  // Initially: No chosen strategy
+-
++  bool chosen = false;
+   /*
+     Semi-join nests cannot be nested, hence we never need to advance the
+     semi-join state of a materialized semi-join query.
+@@ -4448,7 +4533,16 @@ void Optimize_table_order::advance_sj_state(table_map remaining_tables,
+         .add("cost", cost)
+         .add("rows", rowcount)
+         .add("duplicate_tables_left", pos->dups_producing_tables != 0);
+-    if (cost < best_cost || pos->dups_producing_tables) {
++    // Modified: 2022-06-07
++    chosen = false;
++    if(is_multi_plan_open){
++      ++now_query_depth;
++      now_length_per_depth[now_query_depth] = 2;
++      
++      chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++    }
++    else chosen = cost < best_cost;
++    if (chosen || pos->dups_producing_tables) {
+       /*
+         NOTE: When we pick to use SJM[-Scan] we don't memcpy its POSITION
+         elements to join->positions as that makes it hard to return things
+@@ -4497,7 +4591,16 @@ void Optimize_table_order::advance_sj_state(table_map remaining_tables,
+       comparing cost without semi-join duplicate removal with cost with
+       duplicate removal is not an apples-to-apples comparison.
+     */
+-    if (cost < best_cost || pos->dups_producing_tables) {
++    // Modified: 2022-06-07
++    chosen = false;
++    if(is_multi_plan_open){
++      ++now_query_depth;
++      now_length_per_depth[now_query_depth] = 2;
++      
++      chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++    }
++    else chosen = cost < best_cost;
++    if (chosen || pos->dups_producing_tables) {
+       sj_strategy = SJ_OPT_MATERIALIZE_SCAN;
+       best_cost = cost;
+       best_rowcount = rowcount;
+@@ -4551,7 +4654,16 @@ void Optimize_table_order::advance_sj_state(table_map remaining_tables,
+       trace_one_strategy.add("cost", cost)
+           .add("rows", rowcount)
+           .add("duplicate_tables_left", pos->dups_producing_tables != 0);
+-      if ((cost < best_cost &&
++    // Modified: 2022-06-07
++    chosen = false;
++    if(is_multi_plan_open){
++      ++now_query_depth;
++      now_length_per_depth[now_query_depth] = 2;
++      
++      chosen = (now_length_per_depth[now_query_depth] == chosen_per_depth[now_query_depth] + 1);
++    }
++    else chosen = cost < best_cost;
++      if ((chosen &&
+            join->positions[pos->first_dupsweedout_table]
+                    .table->emb_sj_nest->nested_join->sj_enabled_strategies &
+                OPTIMIZER_SWITCH_DUPSWEEDOUT) ||
+diff --git a/sql/sql_planner.h b/sql/sql_planner.h
+index 5093d416..0d23ec6d 100644
+--- a/sql/sql_planner.h
++++ b/sql/sql_planner.h
+@@ -33,6 +33,8 @@
+ #include "my_inttypes.h"
+ #include "my_table_map.h"
+ #include "sql_optimizer.h"
++// Modified: 
++#include "common_vars.h"
+ 
+ class Cost_model_server;
+ class JOIN;

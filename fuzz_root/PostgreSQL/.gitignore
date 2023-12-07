@@ -1,0 +1,4 @@
+afl-fuzz-postgres
+fuzz_output
+MutatorLog
+clientlog

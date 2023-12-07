@@ -1,0 +1,5 @@
+afl-fuzz
+afl-fuzz-mysql
+afl-fuzz-postgres
+compile_commands.json
+.cache

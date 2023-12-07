@@ -1,0 +1,5 @@
+sqlresult
+sqlite3
+MutatorLog
+afl-fuzz
+fuzz_output

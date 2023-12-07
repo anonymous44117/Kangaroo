@@ -1,0 +1,583 @@
+diff --git a/src/backend/access/common/printtup.c b/src/backend/access/common/printtup.c
+index 54b539f..d773aa4 100644
+--- a/src/backend/access/common/printtup.c
++++ b/src/backend/access/common/printtup.c
+@@ -297,6 +297,7 @@ printtup_prepare_info(DR_printtup *myState, TupleDesc typeinfo, int numAttrs)
+  *		printtup --- send a tuple to the client
+  * ----------------
+  */
++extern uint64_t outputlen;
+ static bool
+ printtup(TupleTableSlot *slot, DestReceiver *self)
+ {
+@@ -370,6 +371,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
+ 	}
+ 
+ 	pq_endmessage_reuse(buf);
++	outputlen += buf->len;
+ 
+ 	/* Return to caller's context, and flush row's temporary memory */
+ 	MemoryContextSwitchTo(oldcontext);
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index 70899e5..ab017f6 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -125,6 +125,117 @@ typedef struct
+ 	List	   *uniqueOrder;	/* A List of unique ordering/partitioning
+ 								 * clauses per Window */
+ } WindowClauseSortData;
++/************************************************/
++typedef struct plan_node
++{
++	unsigned int max_plan;
++	unsigned int cur_plan;
++} plan_node;
++
++static struct plan_node plan_array[64];		//one Query may have many subqueries, each query choose its own best path separately
++static unsigned int plan_array_num;	//the number of plan_arrary
++static unsigned int plan_total;		//the number of all possible execution planner
++static unsigned int invoke_time;	//the times of set_cheapset function is invoked during one plan execution
++static unsigned int exec_time;		//the times of the SQL has beeen executed
++static bool create_time;			//whether it is the first time to execute this sql
++static bool move_flag;				//We only mutate one query's paths
++static bool use_multi_plan = false;			//only use multi_plan strategy when SQL only contains one parse tree and is a select statement
++uint64_t outputlen;
++
++#define MAX_OUTPUT_LEN (4UL * 1024 * 1024 * 1024 - 1)
++
++//return false if all plans have been executed
++bool prepare_next_plan()
++{
++	elog(DEBUG1, "outputlen = %lu", outputlen);
++	if((exec_time++ < plan_total - 1) && (outputlen < MAX_OUTPUT_LEN))
++	{
++		create_time = false;
++		move_flag = true;
++		invoke_time = 0;
++		return true;
++	}
++	return false;
++}
++
++//prevent abnormal exit during execution
++void clean_multiplan_environment(void)
++{
++	use_multi_plan = false;
++}
++
++void init_multiplan_environment(void)
++{
++	use_multi_plan = true;
++	create_time = true;
++	plan_total = 1;
++	exec_time = 0;
++	plan_array_num = 0;
++	outputlen = 0;
++}
++
++bool need_exec_multiple_plan(List *querytrees)
++{
++	ListCell   *query_list;
++
++	if(!querytrees)
++		return use_multi_plan;
++
++	foreach(query_list, querytrees)
++	{
++		Query      *query = lfirst_node(Query, query_list);
++		if(query->resultRelation != 0 || query->commandType != CMD_SELECT)
++				return false;
++	}
++	return true;
++}
++
++//set_cheapest
++static Path *choose_my_plan(RelOptInfo *rel)
++{
++	Path	   *cur_path = NULL;
++	unsigned int path_index;
++
++	// elog(LOG, "choose_my_plan begin!");
++	if(!create_time)
++	{
++		if(move_flag)
++		{
++			if (plan_array[invoke_time].cur_plan == plan_array[invoke_time].max_plan - 1)
++				path_index = plan_array[invoke_time].cur_plan = 0;
++			else
++			{
++				path_index = ++plan_array[invoke_time].cur_plan;
++				move_flag = false;
++			}
++		}
++		else
++			path_index = plan_array[invoke_time].cur_plan;
++
++		if (plan_array[invoke_time].max_plan != list_length(rel->pathlist))
++		{
++			elog(LOG, "Unexpected condition in choose_my_plan!\n");
++			Assert(false);
++		}
++
++		cur_path = (Path *)list_nth(rel->pathlist, path_index);
++		invoke_time++;
++	}
++	else
++	{
++		//elog(LOG, "Create plan arr %u\n", plan_array_num);
++		plan_array[plan_array_num].cur_plan = 0;
++		plan_array[plan_array_num].max_plan = list_length(rel->pathlist);
++		plan_total *= list_length(rel->pathlist);
++		cur_path = (Path *)list_nth(rel->pathlist, 0);
++		plan_array_num++;
++		Assert(plan_array_num < 64);
++		elog(LOG, "****create plan finish! total plans: %u****", plan_total);
++	}
++	return cur_path;
++}
++/************************************************/
++
+ 
+ /* Local functions */
+ static Node *preprocess_expression(PlannerInfo *root, Node *expr, int kind);
+@@ -5497,6 +5608,9 @@ get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction)
+ 	Path	   *best_path = rel->cheapest_total_path;
+ 	ListCell   *l;
+ 
++	if (use_multi_plan)
++		return choose_my_plan(rel);
++
+ 	/* If all tuples will be retrieved, just return the cheapest-total path */
+ 	if (tuple_fraction <= 0.0)
+ 		return best_path;
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index ad30703..29bede6 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -35,6 +35,8 @@
+ #include "utils/memutils.h"
+ #include "utils/selfuncs.h"
+ 
++#include "optimizer/planner.h"
++
+ typedef enum
+ {
+ 	COSTS_EQUAL,				/* path costs are fuzzily equal */
+@@ -431,6 +433,19 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+ 	 * planner goes very long without calling add_path().
+ 	 */
+ 	CHECK_FOR_INTERRUPTS();
++	if(need_exec_multiple_plan(NULL))
++	{
++		foreach(p1, parent_rel->pathlist)
++		{
++			Path	   *old_path = (Path *) lfirst(p1);
++			if (new_path->total_cost >= old_path->total_cost)
++				insert_at = foreach_current_index(p1) + 1;
++		}
++	}
++	else
++	{
++
++
+ 
+ 	/* Pretend parameterized paths have no pathkeys, per comment above */
+ 	new_path_pathkeys = new_path->param_info ? NIL : new_path->pathkeys;
+@@ -608,6 +623,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+ 		if (!accept_new)
+ 			break;
+ 	}
++	}
+ 
+ 	if (accept_new)
+ 	{
+@@ -649,6 +665,9 @@ add_path_precheck(RelOptInfo *parent_rel,
+ 	bool		consider_startup;
+ 	ListCell   *p1;
+ 
++	if(need_exec_multiple_plan(NULL))
++		return true;
++
+ 	/* Pretend parameterized paths have no pathkeys, per add_path policy */
+ 	new_path_pathkeys = required_outer ? NIL : pathkeys;
+ 
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index 171f3a9..065e704 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -81,6 +81,7 @@
+ #include "utils/snapmgr.h"
+ #include "utils/timeout.h"
+ #include "utils/timestamp.h"
++#include "optimizer/planner.h"
+ 
+ /* ----------------
+  *		global variables
+@@ -199,6 +200,8 @@ static int	errdetail_recovery_conflict(void);
+ static void bind_param_error_callback(void *arg);
+ static void start_xact_command(void);
+ static void finish_xact_command(void);
++static void start_xact_command_multi(void);
++static void finish_xact_command_multi(void);
+ static bool IsTransactionExitStmt(Node *parsetree);
+ static bool IsTransactionExitStmtList(List *pstmts);
+ static bool IsTransactionStmtList(List *pstmts);
+@@ -963,6 +966,10 @@ exec_simple_query(const char *query_string)
+ 	bool		was_logged = false;
+ 	bool		use_implicit_block;
+ 	char		msec_str[32];
++	bool		consider_multi_plan = false;
++	bool		finish = true;
++	unsigned int	counts = 0;
++
+ 
+ 	/*
+ 	 * Report query to various monitoring facilities.
+@@ -996,6 +1003,9 @@ exec_simple_query(const char *query_string)
+ 	 * unnamed operations.)
+ 	 */
+ 	drop_unnamed_stmt();
++	clean_multiplan_environment();
++	do
++	{
+ 
+ 	/*
+ 	 * Switch to appropriate context for constructing parsetrees.
+@@ -1032,6 +1042,15 @@ exec_simple_query(const char *query_string)
+ 	 * transaction block.
+ 	 */
+ 	use_implicit_block = (list_length(parsetree_list) > 1);
++#if 1
++	if(!consider_multi_plan && (dest == DestRemote || dest == DestRemoteExecute || dest == DestRemoteSimple))
++	{
++		if(!use_implicit_block)
++			consider_multi_plan = true;
++		else
++			elog(LOG, "Query has more than one parsetree_item.\n");
++	}
++#endif
+ 
+ 	/*
+ 	 * Run through the raw parsetree(s) and process each one.
+@@ -1080,7 +1099,7 @@ exec_simple_query(const char *query_string)
+ 					 errdetail_abort()));
+ 
+ 		/* Make sure we are in a transaction command */
+-		start_xact_command();
++		start_xact_command_multi();
+ 
+ 		/*
+ 		 * If using an implicit transaction block, and we're not already in a
+@@ -1129,6 +1148,12 @@ exec_simple_query(const char *query_string)
+ 
+ 		querytree_list = pg_analyze_and_rewrite(parsetree, query_string,
+ 												NULL, 0, NULL);
++		if (consider_multi_plan && finish && need_exec_multiple_plan(querytree_list))
++		{
++			elog(LOG, "****multiple plan set!****");
++			init_multiplan_environment();
++			finish = false;
++		}
+ 
+ 		plantree_list = pg_plan_queries(querytree_list, query_string,
+ 										CURSOR_OPT_PARALLEL_OK, NULL);
+@@ -1236,7 +1261,7 @@ exec_simple_query(const char *query_string)
+ 			 */
+ 			if (use_implicit_block)
+ 				EndImplicitTransactionBlock();
+-			finish_xact_command();
++			finish_xact_command_multi();
+ 		}
+ 		else if (IsA(parsetree->stmt, TransactionStmt))
+ 		{
+@@ -1269,12 +1294,19 @@ exec_simple_query(const char *query_string)
+ 		 * aborted by error will not send an EndCommand report at all.)
+ 		 */
+ 		EndCommand(&qc, dest, false);
++		if(!finish)
++		{
++			// elog(LOG, "Plnaner counts: %u", counts++);
++			(void) counts;
++			if(!prepare_next_plan())
++				finish = true;
++		}
+ 
+ 		/* Now we may drop the per-parsetree context, if one was created. */
+ 		if (per_parsetree_context)
+ 			MemoryContextDelete(per_parsetree_context);
+ 	}							/* end loop over parsetrees */
+-
++	} while (finish != true);
+ 	/*
+ 	 * Close down transaction statement, if one is open.  (This will only do
+ 	 * something if the parsetree list was empty; otherwise the last loop
+@@ -2735,6 +2767,60 @@ finish_xact_command(void)
+ 	}
+ }
+ 
++static void
++start_xact_command_multi(void)
++{
++	if (!xact_started)
++	{
++		StartTransactionCommand();
++
++		xact_started = true;
++	}
++
++	/*
++	 * Start statement timeout if necessary.  Note that this'll intentionally
++	 * not reset the clock on an already started timeout, to avoid the timing
++	 * overhead when start_xact_command() is invoked repeatedly, without an
++	 * interceding finish_xact_command() (e.g. parse/bind/execute).  If that's
++	 * not desired, the timeout has to be disabled explicitly.
++	 */
++	if(!need_exec_multiple_plan(NULL))
++	enable_statement_timeout();
++
++	/* Start timeout for checking if the client has gone away if necessary. */
++	if (client_connection_check_interval > 0 &&
++		IsUnderPostmaster &&
++		MyProcPort &&
++		!get_timeout_active(CLIENT_CONNECTION_CHECK_TIMEOUT))
++		enable_timeout_after(CLIENT_CONNECTION_CHECK_TIMEOUT,
++							 client_connection_check_interval);
++}
++
++static void
++finish_xact_command_multi(void)
++{
++	/* cancel active statement timeout after each command */
++	if(!need_exec_multiple_plan(NULL))
++	disable_statement_timeout();
++
++	if (xact_started)
++	{
++		CommitTransactionCommand();
++
++#ifdef MEMORY_CONTEXT_CHECKING
++		/* Check all memory contexts that weren't freed during commit */
++		/* (those that were, were checked before being deleted) */
++		MemoryContextCheck(TopMemoryContext);
++#endif
++
++#ifdef SHOW_MEMORY_STATS
++		/* Print mem stats after each commit for leak tracking */
++		MemoryContextStats(TopMemoryContext);
++#endif
++
++		xact_started = false;
++	}
++}
+ 
+ /*
+  * Convenience routines for checking whether a statement is one of the
+diff --git a/src/bin/psql/common.c b/src/bin/psql/common.c
+index 9a00499..647b119 100644
+--- a/src/bin/psql/common.c
++++ b/src/bin/psql/common.c
+@@ -1300,22 +1300,55 @@ SendQuery(const char *query)
+ 		if (pset.timing)
+ 			INSTR_TIME_SET_CURRENT(before);
+ 
+-		results = PQexec(pset.db, query);
+-
+-		/* these operations are included in the timing result: */
+-		ResetCancelConn();
+-		OK = ProcessResult(&results);
++		// results = PQexec(pset.db, query);
++		results = NULL;
++		if(PQexecStart(pset.db))
++		{
++			if(PQsendQuery(pset.db, query))
++				results = PQgetResult(pset.db);
++			ResetCancelConn();
++		}
+ 
+-		if (pset.timing)
++		while(results != NULL)
+ 		{
+-			INSTR_TIME_SET_CURRENT(after);
+-			INSTR_TIME_SUBTRACT(after, before);
+-			elapsed_msec = INSTR_TIME_GET_MILLISEC(after);
++			PGresult   *next_result;
++			bool		last;
++
++			OK = ProcessResult(&results);
++			if(OK && results)
++				OK = PrintQueryResults(results);
++
++			next_result = PQgetResult(pset.db);
++			last = (next_result == NULL);
++			if(!last)
++			{
++				fprintf(pset.queryFout, "########\n\n");
++				if(pset.timing)
++				{
++					INSTR_TIME_SET_CURRENT(after);
++					INSTR_TIME_SUBTRACT(after, before);
++					elapsed_msec = INSTR_TIME_GET_MILLISEC(after);
++				}
++			}
++			else
++				fprintf(pset.queryFout, "********************************\n");
++
++			results = next_result;
+ 		}
++		/* these operations are included in the timing result: */
++		// ResetCancelConn();
++		// OK = ProcessResult(&results);
++
++		// if (pset.timing)
++		// {
++		// 	INSTR_TIME_SET_CURRENT(after);
++		// 	INSTR_TIME_SUBTRACT(after, before);
++		// 	elapsed_msec = INSTR_TIME_GET_MILLISEC(after);
++		// }
+ 
+ 		/* but printing results isn't: */
+-		if (OK && results)
+-			OK = PrintQueryResults(results);
++		// if (OK && results)
++		// 	OK = PrintQueryResults(results);
+ 	}
+ 	else
+ 	{
+diff --git a/src/include/optimizer/planner.h b/src/include/optimizer/planner.h
+index 9a15de5..bce6b17 100644
+--- a/src/include/optimizer/planner.h
++++ b/src/include/optimizer/planner.h
+@@ -57,5 +57,9 @@ extern Path *get_cheapest_fractional_path(RelOptInfo *rel,
+ 										  double tuple_fraction);
+ 
+ extern Expr *preprocess_phv_expression(PlannerInfo *root, Expr *expr);
++extern void init_multiplan_environment(void);
++extern void clean_multiplan_environment(void);
++extern bool need_exec_multiple_plan(List *querytrees);
++extern bool prepare_next_plan(void);
+ 
+ #endif							/* PLANNER_H */
+diff --git a/src/interfaces/libpq/exports.txt b/src/interfaces/libpq/exports.txt
+index e8bcc88..7957ba7 100644
+--- a/src/interfaces/libpq/exports.txt
++++ b/src/interfaces/libpq/exports.txt
+@@ -186,3 +186,5 @@ PQpipelineStatus          183
+ PQsetTraceFlags           184
+ PQmblenBounded            185
+ PQsendFlushRequest        186
++PQexecStart               187
++PQexecMultiResults               188
+\ No newline at end of file
+diff --git a/src/interfaces/libpq/fe-exec.c b/src/interfaces/libpq/fe-exec.c
+index 6c7b3df..14f33fe 100644
+--- a/src/interfaces/libpq/fe-exec.c
++++ b/src/interfaces/libpq/fe-exec.c
+@@ -68,8 +68,9 @@ static int	PQsendQueryGuts(PGconn *conn,
+ 							int resultFormat);
+ static void parseInput(PGconn *conn);
+ static PGresult *getCopyResult(PGconn *conn, ExecStatusType copytype);
+-static bool PQexecStart(PGconn *conn);
++// static bool PQexecStart(PGconn *conn);
+ static PGresult *PQexecFinish(PGconn *conn);
++static PGresults *PQexecFinishMultiResults(PGconn *conn);
+ static int	PQsendDescribe(PGconn *conn, char desc_type,
+ 						   const char *desc_target);
+ static int	check_field_number(const PGresult *res, int field_num);
+@@ -2199,6 +2200,16 @@ PQexec(PGconn *conn, const char *query)
+ 	return PQexecFinish(conn);
+ }
+ 
++PGresults *
++PQexecMultiResults(PGconn *conn, const char *query)
++{
++	if (!PQexecStart(conn))
++		return NULL;
++	if (!PQsendQuery(conn, query))
++		return NULL;
++	return PQexecFinishMultiResults(conn);
++}
++
+ /*
+  * PQexecParams
+  *		Like PQexec, but use extended query protocol so we can pass parameters
+@@ -2271,7 +2282,7 @@ PQexecPrepared(PGconn *conn,
+ /*
+  * Common code for PQexec and sibling routines: prepare to send command
+  */
+-static bool
++bool
+ PQexecStart(PGconn *conn)
+ {
+ 	PGresult   *result;
+@@ -2369,6 +2380,44 @@ PQexecFinish(PGconn *conn)
+ 	return lastResult;
+ }
+ 
++/*
++ * Additional code for PQexecMultiResults: wait for command result
++ */
++static PGresults *
++PQexecFinishMultiResults(PGconn *conn)
++{
++	PGresult   *result;
++	PGresults  *results;
++	PGresults  *p;
++	p = NULL;
++	/*
++	 * We have to stop if we see copy in/out/both, however. We will resume
++	 * parsing after application performs the data transfer.
++	 *
++	 * Also stop if the connection is lost (else we'll loop infinitely).
++	 */
++	while ((result = PQgetResult(conn)) != NULL)
++	{
++		if(p == NULL){
++			p = (PGresults*)malloc(sizeof(PGresults));
++			results = p;
++		}
++		else
++		{
++			p->nxt = (PGresults*)malloc(sizeof(PGresults));
++			p = p->nxt;
++		}
++		p->res = result;
++		p->nxt = NULL;
++		if (result->resultStatus == PGRES_COPY_IN ||
++			result->resultStatus == PGRES_COPY_OUT ||
++			result->resultStatus == PGRES_COPY_BOTH ||
++			conn->status == CONNECTION_BAD)
++			break;
++	}
++	return results;
++}
++
+ /*
+  * PQdescribePrepared
+  *	  Obtain information about a previously prepared statement
+diff --git a/src/interfaces/libpq/libpq-fe.h b/src/interfaces/libpq/libpq-fe.h
+index a6fd69a..8a7349f 100644
+--- a/src/interfaces/libpq/libpq-fe.h
++++ b/src/interfaces/libpq/libpq-fe.h
+@@ -170,6 +170,13 @@ typedef struct pg_conn PGconn;
+  */
+ typedef struct pg_result PGresult;
+ 
++struct pg_results{
++	PGresult  *res;
++	struct pg_results *nxt;
++};
++
++typedef struct pg_results PGresults;
++
+ /* PGcancel encapsulates the information needed to cancel a running
+  * query on an existing connection.
+  * The contents of this struct are not supposed to be known to applications.
+@@ -418,6 +425,8 @@ extern void PQsetTraceFlags(PGconn *conn, int flags);
+ 
+ /* Simple synchronous query */
+ extern PGresult *PQexec(PGconn *conn, const char *query);
++extern PGresults *PQexecMultiResults(PGconn *conn, const char *query);
++extern bool PQexecStart(PGconn *conn);
+ extern PGresult *PQexecParams(PGconn *conn,
+ 							  const char *command,
+ 							  int nParams,

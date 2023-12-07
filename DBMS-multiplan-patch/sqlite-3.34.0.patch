@@ -1,0 +1,565 @@
+diff --git a/src/expr.c b/src/expr.c
+index 685f041..71c96fa 100644
+--- a/src/expr.c
++++ b/src/expr.c
+@@ -4151,6 +4151,7 @@ expr_code_doover:
+ #endif
+ 
+       if( ConstFactorOk(pParse) && sqlite3ExprIsConstantNotJoin(pExpr) ){
++        flag |= SQLITE_FactorOutConst;
+         /* SQL functions can be expensive. So try to avoid running them
+         ** multiple times if we know they always give the same result */
+         return sqlite3ExprCodeRunJustOnce(pParse, pExpr, -1);
+@@ -4674,6 +4675,7 @@ void sqlite3ExprCodeCopy(Parse *pParse, Expr *pExpr, int target){
+ */
+ void sqlite3ExprCodeFactorable(Parse *pParse, Expr *pExpr, int target){
+   if( pParse->okConstFactor && sqlite3ExprIsConstantNotJoin(pExpr) ){
++    flag |= SQLITE_FactorOutConst;
+     sqlite3ExprCodeRunJustOnce(pParse, pExpr, target);
+   }else{
+     sqlite3ExprCodeCopy(pParse, pExpr, target);
+diff --git a/src/select.c b/src/select.c
+index d7e1ac0..c5d712a 100644
+--- a/src/select.c
++++ b/src/select.c
+@@ -5921,6 +5921,7 @@ int sqlite3Select(
+      && sqlite3ExprImpliesNonNullRow(p->pWhere, pItem->iCursor)
+      && OptimizationEnabled(db, SQLITE_SimplifyJoin)
+     ){
++      flag |= SQLITE_SimplifyJoin;
+       SELECTTRACE(0x100,pParse,p,
+                 ("LEFT-JOIN simplifies to JOIN on term %d\n",i));
+       pItem->fg.jointype &= ~(JT_LEFT|JT_OUTER);
+@@ -5976,6 +5977,7 @@ int sqlite3Select(
+     }
+ 
+     if( flattenSubquery(pParse, p, i, isAgg) ){
++      flag |= SQLITE_QueryFlattener;
+       if( pParse->nErr ) goto select_end;
+       /* This subquery can be absorbed into its parent. */
+       i = -1;
+@@ -6014,6 +6016,7 @@ int sqlite3Select(
+    && OptimizationEnabled(db, SQLITE_PropagateConst)
+    && propagateConstants(pParse, p)
+   ){
++      flag |= SQLITE_PropagateConst;
+ #if SELECTTRACE_ENABLED
+     if( sqlite3_unsupported_selecttrace & 0x100 ){
+       SELECTTRACE(0x100,pParse,p,("After constant propagation:\n"));
+@@ -6029,6 +6032,7 @@ int sqlite3Select(
+    && countOfViewOptimization(pParse, p)
+   ){
+     if( db->mallocFailed ) goto select_end;
++    flag |= (SQLITE_QueryFlattener|SQLITE_CountOfView);
+     pEList = p->pEList;
+     pTabList = p->pSrc;
+   }
+@@ -6102,6 +6106,7 @@ int sqlite3Select(
+      && pushDownWhereTerms(pParse, pSub, p->pWhere, pItem->iCursor,
+                            (pItem->fg.jointype & JT_OUTER)!=0)
+     ){
++      flag |= SQLITE_PushDown;
+ #if SELECTTRACE_ENABLED
+       if( sqlite3_unsupported_selecttrace & 0x100 ){
+         SELECTTRACE(0x100,pParse,p,
+@@ -6625,6 +6630,7 @@ int sqlite3Select(
+       if( orderByGrp && OptimizationEnabled(db, SQLITE_GroupByOrder) 
+        && (groupBySort || sqlite3WhereIsSorted(pWInfo))
+       ){
++        flag |= SQLITE_GroupByOrder;
+         sSort.pOrderBy = 0;
+         sqlite3VdbeChangeToNoop(v, sSort.addrSortIndex);
+       }
+diff --git a/src/shell.c.in b/src/shell.c.in
+index 2d98d23..fcf445f 100644
+--- a/src/shell.c.in
++++ b/src/shell.c.in
+@@ -1,3 +1,4 @@
++long long outChar;
+ /*
+ ** 2001 September 15
+ **
+@@ -457,7 +458,13 @@ void utf8_printf(FILE *out, const char *zFormat, ...){
+   va_end(ap);
+ }
+ #elif !defined(utf8_printf)
+-# define utf8_printf fprintf
++void utf8_printf(FILE *out, const char *zFormat, ...){
++  va_list ap;
++  va_start(ap, zFormat);
++  int cnt = vfprintf(out, zFormat, ap);
++  if(out != stderr)outChar += cnt;
++  va_end(ap);
++}
+ #endif
+ 
+ /*
+@@ -10447,6 +10454,90 @@ static int runOneSqlLine(ShellState *p, char *zSql, FILE *in, int startline){
+   }
+   return 0;
+ }
++void clr(int depth){
++    if(depth >= num_where_path_solver)return;
++    cnt_nFrom[depth] = 0;
++    clr(depth+1);
++}
++
++int dfs(int depth){
++  if(depth >= num_where_path_solver)return 0;
++  int ret = dfs(depth+1);
++  if(!ret && cnt_nFrom[depth] + 1 < num_nFrom[depth]){
++    cnt_nFrom[depth]++;
++    clr(depth+1);
++    return 1;
++  }
++  return ret;
++}
++
++const char* nms[17] = {"SQLITE_QueryFlattener", "SQLITE_WindowFunc", "SQLITE_GroupByOrder", "SQLITE_FactorOutConst", "SQLITE_DistinctOpt", "SQLITE_CoverIdxScan", "SQLITE_OrderByIdxJoin", "SQLITE_Transitive", "SQLITE_OmitNoopJoin", "SQLITE_CountOfView", "SQLITE_CursorHints", "SQLITE_Stat4", "SQLITE_PushDown", "SQLITE_SimplifyJoin", "SQLITE_SkipScan", "SQLITE_PropagateConst"};
++int vis[131072];
++ShellState* ss;
++char* que;
++clock_t start_time;
++
++int solve(int x){
++    vis[x] = 1;
++    int rc = 0, i, f = 0;
++    // switch the optimization options
++    sqlite3_test_control(SQLITE_TESTCTRL_OPTIMIZATIONS, ss->db, 0x1ffff&(~x));
++    // print the optimization options
++//     printf("OPTIMIZATION OPTION: ( ");
++//     for(i = 0; i < 17; i++)
++//     if(x & (1<<i))printf("%s ",nms[i]);
++//     printf(")\n");
++    // pre-processing
++    // int err = runOneSqlLine(ss, que, ss->in,  ss->lineno);
++    // rc += err;
++    // if(err) utf8_printf(ss->out, "ERROR OCCURRED!\n");
++
++    // execute with different WherePath
++    memset(cnt_nFrom, 0, 32768 * sizeof(int));
++    do{
++      cnt_where_path_solver = 0;
++    //  for(i = 0; i < num_where_path_solver; i++)printf("%d ", num_nFrom[i]);
++    //  for(i = 0; i < num_where_path_solver; i++)printf("%d ", cnt_nFrom[i]);
++    //  puts("");
++      flag = 0;
++      int err = runOneSqlLine(ss, que, ss->in,  ss->lineno);
++      f |= flag;
++      if(err){
++        rc += err;
++        utf8_printf(ss->out, "ERROR OCCURRED!\n");
++      }
++      num_where_path_solver = cnt_where_path_solver;
++      // time check
++      clock_t now_time = clock();
++      if((now_time - start_time) / CLOCKS_PER_SEC >= 3600){
++        utf8_printf(ss->out, "-----------------------------------------------\n");
++        return -1; // break outer loop
++      }
++      // output check
++      long long num_plan = 1, skip_statement = 0;
++      for(i = 0;i < num_where_path_solver;i++){
++        num_plan *= num_nFrom[i];
++        if(num_plan > 100010)
++        skip_statement = 1;
++      }
++      if(skip_statement || outChar > 5368709120LL){
++        utf8_printf(ss->out, "-----------------------------------------------\n");
++        return -1; // break outer loop rather than skip this query statement
++      }
++      // normally
++      utf8_printf(ss->out, "***********************************************\n");
++    }while(dfs(0));
++//     printf("OPTIMIZATION USED: ( ");
++//     for(i = 0; i < 17; i++)
++//     if(f & (1<<i))printf("%s ",nms[i]);
++//     printf(")\n")
++    for(i = f; i != 0; i = (i-1) & f){
++        int y = i | (f ^ 0x1ffff);
++        if(!vis[y])rc += solve(y);
++    }
++    flag = f;
++    return rc;
++}
+ 
+ 
+ /*
+@@ -10469,8 +10560,13 @@ static int process_input(ShellState *p){
+   int errCnt = 0;           /* Number of errors seen */
+   int startline = 0;        /* Line number for start of current input */
+ 
++  int first = 1;
++  ss = p;
++  start_time = clock();
++
+   p->lineno = 0;
+   while( errCnt==0 || !bail_on_error || (p->in==0 && stdin_is_interactive) ){
++    errCnt = 0;
+     fflush(p->out);
+     zLine = one_input_line(p->in, zLine, nSql>0);
+     if( zLine==0 ){
+@@ -10523,7 +10619,55 @@ static int process_input(ShellState *p){
+     }
+     if( nSql && line_contains_semicolon(&zSql[nSqlPrior], nSql-nSqlPrior)
+                 && sqlite3_complete(zSql) ){
+-      errCnt += runOneSqlLine(p, zSql, p->in, startline);
++      if(memcmp(zSql,"SELECT",sizeof("SELECT")-1) == 0 ||
++         memcmp(zSql,"select",sizeof("select")-1) == 0 ||
++         memcmp(zSql,"EXPLAIN",sizeof("EXPLAIN")-1) == 0 ||
++         memcmp(zSql,"explain",sizeof("explain")-1) == 0 ||
++        ((memcmp(zSql,"WITH",sizeof("WITH")-1) == 0 ||
++          memcmp(zSql,"with",sizeof("with")-1) == 0) &&
++          strstr(zSql, "UPDATE") == NULL &&
++          strstr(zSql, "update") == NULL &&
++          strstr(zSql, "INSERT") == NULL &&
++          strstr(zSql, "insert") == NULL &&
++          strstr(zSql, "DELETE") == NULL &&
++          strstr(zSql, "delete") == NULL &&
++         (strstr(zSql, "SELECT") != NULL ||
++          strstr(zSql, "select") != NULL ))){
++          utf8_printf(p->out, "%s\n",zSql);
++          // initialize begin
++          statement_type = 1;
++          cnt_where_path_solver = num_where_path_solver = 0;
++          num_nFrom = (int*)malloc(32768 * sizeof(int));
++          cnt_nFrom = (int*)malloc(32768 * sizeof(int));
++          memset(num_nFrom, 0, 32768 * sizeof(int));
++          memset(cnt_nFrom, 0, 32768 * sizeof(int));
++          // initialize end
++          if(first){
++            errCnt += runOneSqlLine(p, zSql, p->in, startline);
++            if(errCnt) utf8_printf(ss->out, "ERROR OCCURRED!\n");
++            utf8_printf(p->out, "***********************************************\n");
++            first = 0;
++          }
++          que = zSql;
++          memset(vis, 0, sizeof(vis));
++          int ret;
++          ret = solve(0x1ffff);
++          if(ret == -1)break;
++          errCnt += ret;
++          if(flag != 0 && flag != 8){
++            ret = solve(0);
++            if(ret == -1)break;
++            errCnt += ret;
++          }
++          free(num_nFrom);
++          free(cnt_nFrom);
++          utf8_printf(p->out, "END OF A STATEMENT\n");
++      }
++      else{
++        statement_type = 0;
++        first = 0;
++        errCnt += runOneSqlLine(p, zSql, p->in, startline);
++      }
+       nSql = 0;
+       if( p->outCount ){
+         output_reset(p);
+diff --git a/src/sqlite.h.in b/src/sqlite.h.in
+index 3ec8efe..e5d5b89 100644
+--- a/src/sqlite.h.in
++++ b/src/sqlite.h.in
+@@ -1,3 +1,10 @@
++int flag;
++int num_where_path_solver; // times of wherePathSolver called when statement is executed once
++int cnt_where_path_solver; // counter, recording which wherePathSolver is running
++int* num_nFrom; // total number of execute paths obtained
++int* cnt_nFrom; // counter, recording which path of a certain statement is running
++int statement_type;
++
+ /*
+ ** 2001-09-15
+ **
+diff --git a/src/where.c b/src/where.c
+index 2b97114..54210e9 100644
+--- a/src/where.c
++++ b/src/where.c
+@@ -2089,7 +2089,7 @@ static WhereLoop **whereLoopFindLesser(
+      && (pTemplate->wsFlags & WHERE_COLUMN_EQ)!=0
+      && (p->prereq & pTemplate->prereq)==pTemplate->prereq
+     ){
+-      break;
++      if(statement_type == 0)break;
+     }
+ 
+     /* If existing WhereLoop p is better than pTemplate, pTemplate can be
+@@ -2102,7 +2102,7 @@ static WhereLoop **whereLoopFindLesser(
+      && p->rRun<=pTemplate->rRun                      /* (2b) */
+      && p->nOut<=pTemplate->nOut                      /* (2c) */
+     ){
+-      return 0;  /* Discard pTemplate */
++            if(statement_type == 0)return 0;  /* Discard pTemplate */
+     }
+ 
+     /* If pTemplate is always better than p, then cause p to be overwritten
+@@ -2115,7 +2115,7 @@ static WhereLoop **whereLoopFindLesser(
+      && p->nOut>=pTemplate->nOut                             /* (2b) */
+     ){
+       assert( p->rSetup>=pTemplate->rSetup ); /* SETUP-INVARIANT above */
+-      break;   /* Cause p to be overwritten by pTemplate */
++      if(statement_type == 0)break;   /* Cause p to be overwritten by pTemplate */
+     }
+   }
+   return ppPrev;
+@@ -2779,6 +2779,7 @@ static int whereLoopAddBtreeIndex(
+    && pProbe->aiRowLogEst[saved_nEq+1]>=42  /* TUNING: Minimum for skip-scan */
+    && (rc = whereLoopResize(db, pNew, pNew->nLTerm+1))==SQLITE_OK
+   ){
++    flag |= SQLITE_SkipScan;
+     LogEst nIter;
+     pNew->u.btree.nEq++;
+     pNew->nSkip++;
+@@ -3097,6 +3098,7 @@ static int whereLoopAddBtree(
+          && (pWInfo->wctrlFlags & WHERE_ONEPASS_DESIRED)==0
+          && sqlite3GlobalConfig.bUseCis
+          && OptimizationEnabled(pWInfo->pParse->db, SQLITE_CoverIdxScan)
++         && (flag |= SQLITE_CoverIdxScan)
+           )
+       ){
+         pNew->iSortIdx = b ? iSortIdx : 0;
+@@ -4105,6 +4107,11 @@ static LogEst whereSortingCost(
+   rSortCost += estLog(nRow);
+   return rSortCost;
+ }
++int comp(const void* p1, const void* p2){
++  WherePath* w1 = (WherePath*)p1;
++  WherePath* w2 = (WherePath*)p2;
++  return w1->rCost - w2->rCost;
++}
+ 
+ /*
+ ** Given the list of WhereLoop objects at pWInfo->pLoops, this routine
+@@ -4146,7 +4153,8 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+   /* TUNING: For simple queries, only the best path is tracked.
+   ** For 2-way joins, the 5 best paths are followed.
+   ** For joins of 3 or more tables, track the 10 best paths */
+-  mxChoice = (nLoop<=1) ? 1 : (nLoop==2 ? 5 : 10);
++  if(statement_type)mxChoice = 256;
++  else mxChoice = (nLoop<=1) ? 1 : (nLoop==2 ? 5 : 10);
+   assert( nLoop<=pWInfo->pTabList->nSrc );
+   WHERETRACE(0x002, ("---- begin solver.  (nRowEst=%d)\n", nRowEst));
+ 
+@@ -4239,6 +4247,7 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+           isOrdered = wherePathSatisfiesOrderBy(pWInfo,
+                        pWInfo->pOrderBy, pFrom, pWInfo->wctrlFlags,
+                        iLoop, pWLoop, &revMask);
++          if(isOrdered)flag |= SQLITE_OrderByIdxJoin;
+         }else{
+           revMask = pFrom->revLoop;
+         }
+@@ -4274,6 +4283,7 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+         ** to (pTo->isOrdered==(-1))==(isOrdered==(-1))" for the range
+         ** of legal values for isOrdered, -1..64.
+         */
++       if(statement_type == 0){
+         for(jj=0, pTo=aTo; jj<nTo; jj++, pTo++){
+           if( pTo->maskLoop==maskNew
+            && ((pTo->isOrdered^isOrdered)&0x80)==0
+@@ -4316,7 +4326,8 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+                 isOrdered>=0 ? isOrdered+'0' : '?');
+           }
+ #endif
+-        }else{
++        }
++		else{
+           /* Control reaches here if best-so-far path pTo=aTo[jj] covers the
+           ** same set of loops and has the same isOrdered setting as the
+           ** candidate path.  Check to see if the candidate should replace
+@@ -4362,6 +4373,42 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+           }
+ #endif
+         }
++	  }
++      else{
++          /* Add WhereLoop candidate to set ignoring cost and mask. */
++          if( nTo>=mxChoice
++           && (rCost>mxCost || (rCost==mxCost && rUnsorted>=mxUnsorted))
++          ){
++            /* The current candidate is no better than any of the mxChoice
++            ** paths currently in the best-so-far buffer.  So discard
++            ** this candidate as not viable. */
++#ifdef WHERETRACE_ENABLED /* 0x4 */
++            if( sqlite3WhereTrace&0x4 ){
++              sqlite3DebugPrintf("Skip   %s cost=%-3d,%3d,%3d order=%c\n",
++                  wherePathName(pFrom, iLoop, pWLoop), rCost, nOut, rUnsorted,
++                  isOrdered>=0 ? isOrdered+'0' : '?');
++            }
++#endif
++            continue;
++          }
++          /* If we reach this points it means that the new candidate path
++          ** needs to be added to the set of best-so-far paths. */
++          if( nTo<mxChoice ){
++            /* Increase the size of the aTo set by one */
++            jj = nTo++;
++          }else{
++            /* New path replaces the prior worst to keep count below mxChoice */
++            jj = mxI;
++          }
++          pTo = &aTo[jj];
++#ifdef WHERETRACE_ENABLED /* 0x4 */
++          if( sqlite3WhereTrace&0x4 ){
++            sqlite3DebugPrintf("New    %s cost=%-3d,%3d,%3d order=%c\n",
++                wherePathName(pFrom, iLoop, pWLoop), rCost, nOut, rUnsorted,
++                isOrdered>=0 ? isOrdered+'0' : '?');
++          }
++#endif
++      }
+         /* pWLoop is a winner.  Add it to the set of best so far */
+         pTo->maskLoop = pFrom->maskLoop | pWLoop->maskSelf;
+         pTo->revLoop = revMask;
+@@ -4411,6 +4458,15 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+     nFrom = nTo;
+   }
+ 
++  if(statement_type){
++    //printf("Level: %d %d -> %d, ", cnt_where_path_solver, num_nFrom[cnt_where_path_solver], nFrom);
++    //puts();
++    num_nFrom[cnt_where_path_solver++] = nFrom;
++    // 2021-07-09 in virtual table, sometimes number of wherePathSolver() maybe too large.
++    // In this case, only MAX_NUM wherePathSolver() will be executed.
++    assert(cnt_where_path_solver < 32768);
++    if(cnt_where_path_solver >= 32768)return SQLITE_ERROR;
++  }
+   if( nFrom==0 ){
+     sqlite3ErrorMsg(pParse, "no query solution");
+     sqlite3DbFreeNN(db, pSpace);
+@@ -4419,8 +4475,14 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+   
+   /* Find the lowest cost path.  pFrom will be left pointing to that path */
+   pFrom = aFrom;
+-  for(ii=1; ii<nFrom; ii++){
+-    if( pFrom->rCost>aFrom[ii].rCost ) pFrom = &aFrom[ii];
++  if(statement_type && (cnt_nFrom[cnt_where_path_solver - 1] < num_nFrom[cnt_where_path_solver - 1])){
++    pFrom = &aFrom[cnt_nFrom[cnt_where_path_solver - 1]];
++  }
++  else{
++    pFrom = aFrom;
++    for(ii=1; ii<nFrom; ii++){
++      if( pFrom->rCost>aFrom[ii].rCost ) pFrom = &aFrom[ii];
++    }
+   }
+   assert( pWInfo->nLevel==nLoop );
+   /* Load the lowest cost path into pWInfo */
+@@ -4438,7 +4500,9 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+     Bitmask notUsed;
+     int rc = wherePathSatisfiesOrderBy(pWInfo, pWInfo->pResultSet, pFrom,
+                  WHERE_DISTINCTBY, nLoop-1, pFrom->aLoop[nLoop-1], &notUsed);
++    if(rc)flag |= SQLITE_OrderByIdxJoin;
+     if( rc==pWInfo->pResultSet->nExpr ){
++      flag |= SQLITE_DistinctOpt;
+       pWInfo->eDistinct = WHERE_DISTINCT_ORDERED;
+     }
+   }
+@@ -4461,6 +4525,7 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+             Bitmask m = 0;
+             int rc = wherePathSatisfiesOrderBy(pWInfo, pWInfo->pOrderBy, pFrom,
+                       WHERE_ORDERBY_LIMIT, nLoop-1, pFrom->aLoop[nLoop-1], &m);
++            if(rc)flag |= SQLITE_OrderByIdxJoin;
+             testcase( wsFlags & WHERE_IPK );
+             testcase( wsFlags & WHERE_COLUMN_IN );
+             if( rc==pWInfo->pOrderBy->nExpr ){
+@@ -4483,6 +4548,7 @@ static int wherePathSolver(WhereInfo *pWInfo, LogEst nRowEst){
+       int nOrder = wherePathSatisfiesOrderBy(pWInfo, pWInfo->pOrderBy, 
+           pFrom, 0, nLoop-1, pFrom->aLoop[nLoop-1], &revMask
+       );
++      if(nOrder)flag |= SQLITE_OrderByIdxJoin;
+       assert( pWInfo->sorted==0 );
+       if( nOrder==pWInfo->pOrderBy->nExpr ){
+         pWInfo->sorted = 1;
+@@ -4579,6 +4645,7 @@ static int whereShortCut(WhereLoopBuilder *pBuilder){
+     pWInfo->nRowOut = 1;
+     if( pWInfo->pOrderBy ) pWInfo->nOBSat =  pWInfo->pOrderBy->nExpr;
+     if( pWInfo->wctrlFlags & WHERE_WANT_DISTINCT ){
++      flag |= SQLITE_DistinctOpt;
+       pWInfo->eDistinct = WHERE_DISTINCT_UNIQUE;
+     }
+ #ifdef SQLITE_DEBUG
+@@ -4840,6 +4907,7 @@ WhereInfo *sqlite3WhereBegin(
+   if( nTabList==0 ){
+     if( pOrderBy ) pWInfo->nOBSat = pOrderBy->nExpr;
+     if( wctrlFlags & WHERE_WANT_DISTINCT ){
++      flag |= SQLITE_DistinctOpt;
+       pWInfo->eDistinct = WHERE_DISTINCT_UNIQUE;
+     }
+     ExplainQueryPlan((pParse, 0, "SCAN CONSTANT ROW"));
+@@ -4900,10 +4968,13 @@ WhereInfo *sqlite3WhereBegin(
+   }
+ 
+   if( wctrlFlags & WHERE_WANT_DISTINCT ){
++      flag |= SQLITE_DistinctOpt;
+     if( isDistinctRedundant(pParse, pTabList, &pWInfo->sWC, pResultSet) ){
++      flag |= SQLITE_DistinctOpt;
+       /* The DISTINCT marking is pointless.  Ignore it. */
+       pWInfo->eDistinct = WHERE_DISTINCT_UNIQUE;
+     }else if( pOrderBy==0 ){
++      flag |= SQLITE_DistinctOpt;
+       /* Try to ORDER BY the result set to make distinct processing easier */
+       pWInfo->wctrlFlags |= WHERE_DISTINCTBY;
+       pWInfo->pOrderBy = pResultSet;
+@@ -4935,7 +5006,7 @@ WhereInfo *sqlite3WhereBegin(
+   }
+ #endif
+ 
+-  if( nTabList!=1 || whereShortCut(&sWLB)==0 ){
++  if( statement_type || nTabList!=1 || whereShortCut(&sWLB)==0 ){
+     rc = whereLoopAddAll(&sWLB);
+     if( rc ) goto whereBeginError;
+ 
+@@ -4964,6 +5035,7 @@ WhereInfo *sqlite3WhereBegin(
+     wherePathSolver(pWInfo, 0);
+     if( db->mallocFailed ) goto whereBeginError;
+     if( pWInfo->pOrderBy ){
++      cnt_where_path_solver--;
+        wherePathSolver(pWInfo, pWInfo->nRowOut+1);
+        if( db->mallocFailed ) goto whereBeginError;
+     }
+@@ -5063,6 +5135,7 @@ WhereInfo *sqlite3WhereBegin(
+         }
+       }
+       if( pTerm<pEnd ) continue;
++      flag |= SQLITE_OmitNoopJoin;
+       WHERETRACE(0xffff, ("-> drop loop %c not used\n", pLoop->cId));
+       notReady &= ~pLoop->maskSelf;
+       for(pTerm=sWLB.pWC->a; pTerm<pEnd; pTerm++){
+diff --git a/src/wherecode.c b/src/wherecode.c
+index 4afe0ac..5ed90ee 100644
+--- a/src/wherecode.c
++++ b/src/wherecode.c
+@@ -940,6 +940,7 @@ static void codeCursorHint(
+   Walker sWalker;
+ 
+   if( OptimizationDisabled(db, SQLITE_CursorHints) ) return;
++  flag |= SQLITE_CursorHints;
+   iCur = pLevel->iTabCur;
+   assert( iCur==pWInfo->pTabList->a[pLevel->iFrom].iCursor );
+   sHint.iTabCur = iCur;
+diff --git a/src/whereexpr.c b/src/whereexpr.c
+index a77eb36..3b5e1fb 100644
+--- a/src/whereexpr.c
++++ b/src/whereexpr.c
+@@ -1126,6 +1126,7 @@ static void exprAnalyze(
+         pTerm->wtFlags |= TERM_COPIED;
+ 
+         if( termIsEquivalence(pParse, pDup) ){
++          flag |= SQLITE_Transitive;
+           pTerm->eOperator |= WO_EQUIV;
+           eExtraOp = WO_EQUIV;
+         }
+diff --git a/src/window.c b/src/window.c
+index 88ff7d3..cfaf625 100644
+--- a/src/window.c
++++ b/src/window.c
+@@ -1199,8 +1199,9 @@ Window *sqlite3WindowAlloc(
+   pWin->eFrmType = eType;
+   pWin->eStart = eStart;
+   pWin->eEnd = eEnd;
+-  if( eExclude==0 && OptimizationDisabled(pParse->db, SQLITE_WindowFunc) ){
+-    eExclude = TK_NO;
++  if( eExclude==0){
++    if(OptimizationDisabled(pParse->db, SQLITE_WindowFunc) )eExclude = TK_NO;
++    else flag |= SQLITE_WindowFunc;
+   }
+   pWin->eExclude = eExclude;
+   pWin->bImplicitFrame = bImplicitFrame;
